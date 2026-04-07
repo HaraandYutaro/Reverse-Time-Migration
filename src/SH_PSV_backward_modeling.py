@@ -109,11 +109,7 @@ class backward_modeling(WaveSimulation):
         # absorbing coefficient
         self.absorb_coeff = self.absorb()
 
-        ## obsdata scaling
-        gain = 16
-        ms_V = 28.8
-        maxV = 2.5
-        self.maxAD = 2 ** 23
+        self.maxAD = 2 ** 23  # ADC full-scale count for raw data scaling
 
     def update_vel(self, order):
         if order == 2:
@@ -244,31 +240,41 @@ class backward_modeling(WaveSimulation):
         self.initialize()
         if show:
             self.plot_wavefield()
+
+        # Precompute index arrays and scaling factors for vectorized injection/extraction
+        rec_loc_arr = cp.array(self.receiver_loc)
+        rec_i = rec_loc_arr[:, 0]
+        rec_j = rec_loc_arr[:, 1]
+        scale = self.dt * self.dx * self.dz / self.maxAD
+        rec_scale_u = scale / self.rho_u[rec_i, rec_j]
+        rec_scale_v = scale / self.rho[rec_i, rec_j]
+        rec_scale_w = scale / self.rho_w[rec_i, rec_j]
+        src_loc_arr = cp.array(self.src_loc)
+        src_i = src_loc_arr[:, 0]
+        src_j = src_loc_arr[:, 1]
+
         for it in range(self.nt):
-            # free surface boundary condition Z=0
             self.set_boundary_condition()
 
             t = self.nt - it - 1  # real timestep
             self.update_vel(order=self.order)
-            # add source term at the source location
-            for k, loc in enumerate(self.receiver_loc):
-                i, j = loc
-                self.u[i, j] += self.obsdata_u[k, t] * self.dt / self.rho_u[i, j] * self.dx * self.dz / self.maxAD
-                self.v[i, j] += self.obsdata_v[k, t] * self.dt / self.rho[i, j] * self.dx * self.dz / self.maxAD
-                self.w[i, j] += self.obsdata_w[k, t] * self.dt / self.rho_w[i, j] * self.dx * self.dz / self.maxAD
+
+            self.u[rec_i, rec_j] += self.obsdata_u[:, t] * rec_scale_u
+            self.v[rec_i, rec_j] += self.obsdata_v[:, t] * rec_scale_v
+            self.w[rec_i, rec_j] += self.obsdata_w[:, t] * rec_scale_w
+
             self.update_str(order=self.order)
-            for l, loc in enumerate(self.src_loc):
-                i, j = loc
-                self.synsrc_u[l, t] = self.u[i, j].get()
-                self.synsrc_v[l, t] = self.v[i, j].get()
-                self.synsrc_w[l, t] = self.w[i, j].get()
+
+            # Stay on GPU; single .get() per component after the loop via show_src()
+            self.synsrc_u[:, t] = self.u[src_i, src_j]
+            self.synsrc_v[:, t] = self.v[src_i, src_j]
+            self.synsrc_w[:, t] = self.w[src_i, src_j]
 
             if it % self.isnap == 0:
                 print(f'i={it}/{self.nt}')
                 if show:
                     self.display_wavefield()
 
-            # check if the wavefield is infinite: flag
             if not cp.all(cp.isfinite(self.u)):
                 return 4
             if not cp.all(cp.isfinite(self.v)):

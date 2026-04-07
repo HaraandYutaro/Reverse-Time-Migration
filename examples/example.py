@@ -82,7 +82,7 @@ for npz_path in npzs_path_list:
     npz = np.load(npz_path)
     distance = npz['distance']
     source_x = npz['source_x']
-    source_ch = cp.int32(get_source_ch(distance, source_x))
+    source_ch = get_source_ch(distance, source_x)  # keep as Python list for numpy indexing
     receiver_loc = cp.array(distance)
     source_loc = cp.array(source_x)
     fs = cp.float32(sampling_freq)
@@ -117,7 +117,7 @@ for npz_path in npzs_path_list:
                                 v_fix = velocity,
                                 debug = False,
                                 )
-    RTM.run(total_memory = 28000, memory_merge = 4000)
+    RTM.run(total_memory = 20000, memory_merge = 4000)
 
     savename = f'{npz_path.split("/")[-1].split(".")[0]}'
     RTM.save_result(dir= dir_rtm +  'data/', savename = savename)

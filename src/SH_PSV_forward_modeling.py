@@ -15,6 +15,8 @@
 # along with this library. If not, see <https://www.gnu.org/licenses/>.
 
 # 1. 順方向モデリング
+import time
+
 import cupy as cp  # CuPy is imported as cp for compatibility
 import matplotlib.pyplot as plt
 import matplotlib
@@ -296,6 +298,8 @@ class forward_modeling(WaveSimulation):
         show: bool, default True, if True, show wavefield
         save: bool, default False, if True, save wavefield
         """
+        cp.get_default_memory_pool().free_all_blocks()
+
         if save:  # allocate saved u,v,w, whose sizes are (nx,nz,nt//isnap)
             self.u_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
             self.v_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
@@ -362,3 +366,102 @@ class forward_modeling(WaveSimulation):
         plt.subplots_adjust(left=0.06, right=0.98, bottom=0.02, top=0.92, hspace=0.023, wspace=0)
         plt.show()
         plt.pause(1.)
+
+    def run_gui(self, save=False):
+        """
+        Run forward modeling with a Dear PyGui interactive viewer.
+
+        The simulation advances one time-step per rendered GUI frame.
+        Wavefield textures are updated on the GPU->CPU transfer only when
+        ``step % gui.isnap == 0`` (controlled live by the isnap slider).
+
+        return:
+             0: simulation completed,
+             1: u diverged (infinite),
+             2: v diverged (infinite),
+             3: w diverged (infinite).
+        save: bool, default False – if True, snapshot arrays are stored in
+              self.u_save / v_save / w_save (float32, shape nx×nz×(nt//isnap)).
+        """
+        from visualizer import SimulationGUI  # optional DPG dependency
+
+        # Free VRAM before large allocations (G14 memory constraint)
+        cp.get_default_memory_pool().free_all_blocks()
+
+        if save:
+            self.u_save = cp.zeros(
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+            self.v_save = cp.zeros(
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+            self.w_save = cp.zeros(
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+            self.isnaps = cp.zeros(self.nt // self.isnap, dtype=cp.int32)
+
+        self.initialize()
+
+        gui = SimulationGUI(self.nx, self.nz, self.dx, self.dz)
+        gui.isnap = self.isnap   # sync initial slider value with class default
+        gui.setup(self.nt)
+
+        it = 0
+        step_time_ms = 0.0
+
+        while gui.is_running():
+            if gui.playing and it < self.nt:
+                t0 = time.perf_counter()
+
+                self.set_boundary_condition()
+                self.update_vel(order=self.order)
+
+                # Source injection (vectorized)
+                self.u[self._src_i, self._src_j] += (
+                    self.wavelet_u[:, it] * self._src_scale_u)
+                self.v[self._src_i, self._src_j] += (
+                    self.wavelet_v[:, it] * self._src_scale_v)
+                self.w[self._src_i, self._src_j] += (
+                    self.wavelet_w[:, it] * self._src_scale_w)
+
+                self.update_str(order=self.order)
+
+                # Seismogram extraction (stays on GPU)
+                self.seismogram_u[:, it] = self.u[self._rec_i, self._rec_j]
+                self.seismogram_v[:, it] = self.v[self._rec_i, self._rec_j]
+                self.seismogram_w[:, it] = self.w[self._rec_i, self._rec_j]
+
+                step_time_ms = (time.perf_counter() - t0) * 1000.0
+
+                # GPU→CPU transfer only when display update is due
+                if it % gui.isnap == 0:
+                    u_cpu = cp.asnumpy(self.u)
+                    v_cpu = cp.asnumpy(self.v)
+                    w_cpu = cp.asnumpy(self.w)
+                    gui.update_textures(u_cpu, v_cpu, w_cpu)
+                    gui.update_status(it, step_time_ms)
+
+                if save and it % self.isnap == 0 and it != 0:
+                    self.u_save[:, :, it // self.isnap - 1] = self.u
+                    self.v_save[:, :, it // self.isnap - 1] = self.v
+                    self.w_save[:, :, it // self.isnap - 1] = self.w
+                    self.isnaps[it // self.isnap - 1] = it
+
+                if not cp.all(cp.isfinite(self.u)):
+                    gui.cleanup()
+                    return 1
+                if not cp.all(cp.isfinite(self.v)):
+                    gui.cleanup()
+                    return 2
+                if not cp.all(cp.isfinite(self.w)):
+                    gui.cleanup()
+                    return 3
+
+                it += 1
+
+                if it >= self.nt:
+                    # Simulation finished — push final status and stay open
+                    gui.update_status(it, step_time_ms)
+
+            gui.render_frame()
+
+        gui.cleanup()
+        print('end forward modeling (GUI)')
+        return 0
