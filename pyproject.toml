@@ -1,0 +1,14 @@
+[project]
+name = "reverse-time-migration"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "cupy-cuda12x>=14.0.1",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.4",
+    "nvidia-cuda-cccl-cu12>=12.9.27",
+    "nvidia-cuda-nvrtc-cu12>=12.9.86",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
+]

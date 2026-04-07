@@ -60,7 +60,7 @@ relationships of u,v,w plane
 
 """
 # Here I use npz file.
-dir = 'example/seismic data/data/' # write parent directry here
+dir = 'examples/npz data/' # write parent directry here
 npzs_path_list = glob.glob(f'{dir}*.npz')
 
 # data setup
@@ -74,7 +74,7 @@ geophone = 28.8V/m/s
 logger:+-2.5V, 24bit -> 
 """
 
-dir_rtm= f'example/results/'
+dir_rtm= f'examples/results2/'
 if not os.path.exists(dir_rtm):
     os.makedirs(dir_rtm)
 

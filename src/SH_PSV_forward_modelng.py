@@ -19,7 +19,7 @@ import cupy as cp  # CuPy is imported as cp for compatibility
 import matplotlib.pyplot as plt
 import matplotlib
 import numpy as np
-matplotlib.use('TkAgg')  # または 'Agg' を使用
+matplotlib.use('Agg') 
 import os
 
 """
