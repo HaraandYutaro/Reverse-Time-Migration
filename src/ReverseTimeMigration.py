@@ -21,7 +21,7 @@ Reverse Time Migration
 2.Forward modeling to generate the synthetic data   
 3.Backward modeling 
 """
-import SH_PSV_forward_modelng as fw
+import SH_PSV_forward_modeling as fw
 import SH_PSV_backward_modeling as bk
 import cupy as cp
 import numpy as np
@@ -72,15 +72,15 @@ class ReverseTimeMigration:
         self.nt = self.observed_u.shape[1]
 
         ## import other value for simulation
-        self. absorbing_frame = kwargs['absorbing_frame'] if 'absorbing_frame' in kwargs else 50
+        self.absorbing_frame = kwargs['absorbing_frame'] if 'absorbing_frame' in kwargs else 50
         self.vmin = kwargs['vmin'] if 'vmin' in kwargs else 10.
         self.vmax = kwargs['vmax'] if 'vmax' in kwargs else 500.
         self.vstep = kwargs['vstep'] if 'vstep' in kwargs else 10
         self.v_fix = kwargs['v_fix'] if 'v_fix' in kwargs else None
         self.debug = kwargs['debug'] if 'debug' in kwargs else False
         self.receivers_height = kwargs['receivers_height'] if 'receivers_height' in kwargs else None 
-        recerivers_height = self.receivers_height  - cp.max(self.receivers_height) if self.receivers_height is not None else None
-        self.receivers_height = recerivers_height # recerivers_height is negative value. 0 is the highest point
+        receivers_height = self.receivers_height - cp.max(self.receivers_height) if self.receivers_height is not None else None
+        self.receivers_height = receivers_height  # receivers_height is negative value. 0 is the highest point
 
         self.check_parameters()
         pass
@@ -101,14 +101,14 @@ class ReverseTimeMigration:
                 raise ValueError('The size of the receiver height is not correct.')   
         pass
 
-    def estimate_velocity(self, array:cp.array, vmin, vmax, method='closs_corriation', vstep = 10):
+    def estimate_velocity(self, array:cp.array, vmin, vmax, method='cross_correlation', vstep = 10):
         print('Estimate the velocity')
         M, L = array.shape
         r = (vmax/vmin)**(1/(vstep-1))
         v_array = vmin*r**cp.arange(vstep)
         sum_max = 0
         v_estimated = vmin
-        if method == 'closs_corriation':
+        if method == 'cross_correlation':
             for v in v_array:
                 abs_d = cp.abs(self.receiver_loc - self.source_loc)
                 tsteps = (self.fs * abs_d / v)# array(Num_sensor, dtype=np.float32)
@@ -156,178 +156,181 @@ class ReverseTimeMigration:
             isnap = int(cp.ceil(nt / max_steps).item())
         return isnap
 
-    def run(self, total_memory = 24000, memory_merge = 2000, backwardmodel_method = 'closs_correlation'):
-        """
-        run the Reverse Time Migration
-        1. estimate the velocity
-        2. Forward and backward modeling to generate the synthetic data
-        3. calculate the cross-correlation between the forward and backward modeling data
-
-        Parameters
-        ----------------------------------------------
-        total_memory : int
-            the total memory for the simulation (MiB)
-        memory_merge : int
-            the memory for the other process (MiB)
-        ----------------------------------------------
-
-        backwardmodel_method : str
-        'closs_correlation' : calculate the cross-correlation between the forward and backward modeling data
-        'convolution' : calculate the convolution between the forward and backward modeling data
-        """    
-        # estimate velocity
+    def _estimate_or_fix_velocity(self):
+        """Return the propagation velocity to use: fixed or cross-correlation estimate."""
         if self.v_fix is not None:
             print(f'the velocity is selected as fixed {self.v_fix}m/s')
-            estimated_v = self.v_fix
-        else:
-            estimated_v = self.estimate_velocity(self.observed_v, self.vmin, self.vmax, vstep = self.vstep)
+            return self.v_fix
+        return self.estimate_velocity(self.observed_v, self.vmin, self.vmax, vstep=self.vstep)
 
-        # 2. Forward and backward modeling to generate the synthetic data
+    def _build_surface_geometry(self, dx, dz, nx, nz, absorbing_frame):
+        """
+        Build receiver_loc_step, src_loc_step, surface_matrix, and steepness_array
+        from the current receiver/source locations and optional topography.
+        Returns (receiver_loc_step, src_loc_step, surface_matrix, steepness_array).
+        """
+        offset = 2 * absorbing_frame
+        i_coords = (self.receiver_loc / dx + offset).astype(cp.int32)
+        receiver_loc_step = [[int(i_coords[k].item()), 1] for k in range(len(i_coords))]
+        src_loc_step = [[int(self.source_loc / dx + offset), 1]]
+        surface_matrix = cp.ones((nx, nz), dtype=cp.float32)
+        height_array = cp.zeros((nx,), dtype=cp.float32)
+        steepness_array = cp.zeros_like(height_array)  # 0 steepness at boundary
+
+        receivers_height = self.receivers_height
+        if receivers_height is not None:
+            receivers_height_step = -1 * cp.ones_like(receivers_height) * receivers_height / dz
+
+            for i, locstep in enumerate(receiver_loc_step):
+                heightstep = receivers_height_step[i]
+                receiver_loc_step[i][1] = int(heightstep)
+                if i == 0:
+                    surface_matrix[:locstep[0], :heightstep] = 0
+                    height_array[:locstep[0]] = heightstep
+                if i > 0:
+                    next_locstep = receiver_loc_step[i][0]
+                    locstep = receiver_loc_step[i - 1][0]
+                    next_heightstep = receivers_height_step[i]
+                    heightstep = receivers_height_step[i - 1]
+                    for ix in range(locstep, next_locstep):
+                        lean = (next_heightstep - heightstep) / (next_locstep - locstep)
+                        height_ix = lean * (ix - locstep) + heightstep
+                        surface_matrix[ix, :int(height_ix)] = 0
+                        height_array[ix] = height_ix
+
+            height_array[receiver_loc_step[-1][0]:] = receivers_height_step[-1]
+            surface_matrix[receiver_loc_step[-1][0]:, :int(receivers_height_step[-1])] = 0
+
+            self.height_array = height_array
+
+            # Central-difference steepness (vectorized)
+            steepness_array[1:-1] = (height_array[2:] - height_array[:-2]) * dz / dx
+            self.steepness_array = steepness_array
+
+            if self.debug:
+                plt.plot(height_array.get())
+                plt.title('Surface Shape')
+                plt.show()
+                plt.imshow(surface_matrix.get().T)
+                plt.title('Surface Matrix')
+                plt.show()
+
+            self.surface_matrix = surface_matrix
+            src_loc_ind = src_loc_step[0][0]
+            src_loc_step[0][1] = int(height_array[src_loc_ind] + 1)  # source above surface
+
+        return receiver_loc_step, src_loc_step, surface_matrix, steepness_array
+
+    def _run_forward(self, nx, nz, dx, dz, nt, isnap,
+                     vs, vp, rho, absorbing_frame,
+                     src_loc_step, receiver_loc_step,
+                     surface_matrix, steepness_array):
+        """Instantiate and run forward_modeling. Returns (flag, _fw)."""
+        _fw = fw.forward_modeling(
+            nx=nx, nz=nz, dx=dx, dz=dz,
+            nt=nt, fs=self.fs,
+            vs=vs, vp=vp, rho=rho,
+            absorbing_frame=absorbing_frame,
+            src_loc=src_loc_step,
+            wavelet_u=self.source_u,
+            wavelet_v=self.source_v,
+            wavelet_w=self.source_w,
+            receiver_loc=receiver_loc_step,
+            isnap=isnap,
+            receivers_height=self.receivers_height,
+            surface_matrix=surface_matrix,
+            steepness_array=steepness_array,
+        )
+        flag = _fw.run(show=self.debug, save=True)
+        return flag, _fw
+
+    def _run_backward(self, nx, nz, dx, dz, nt,
+                      vs, vp, rho, absorbing_frame,
+                      src_loc_step, receiver_loc_step,
+                      surface_matrix, steepness_array,
+                      _fw, backwardmodel_method):
+        """Instantiate and run backward_modeling with cross-correlation. Returns (flag, _bw)."""
+        _bw = bk.backward_modeling(
+            nx=nx, nz=nz, dx=dx, dz=dz,
+            nt=nt, fs=self.fs,
+            vs=vs, vp=vp, rho=rho,
+            absorbing_frame=absorbing_frame,
+            src_loc=src_loc_step,
+            observed_data_u=self.observed_u,
+            observed_data_v=self.observed_v,
+            observed_data_w=self.observed_w,
+            receiver_loc=receiver_loc_step,
+            isnap=_fw.isnaps,
+            receivers_height=self.receivers_height,
+            surface_matrix=surface_matrix,
+            steepness_array=steepness_array,
+        )
+        flag = _bw.run_calc(
+            show=self.debug,
+            import_fwdata_u=_fw.u_save,
+            import_fwdata_v=_fw.v_save,
+            import_fwdata_w=_fw.w_save,
+            isnaps=_fw.isnaps,
+            save=False,
+            method=backwardmodel_method,
+        )
+        return flag, _bw
+
+    def run(self, total_memory=24000, memory_merge=2000, backwardmodel_method='cross_correlation'):
+        """
+        Run the Reverse Time Migration pipeline:
+        1. Estimate the propagation velocity
+        2. Run forward modeling (save snapshots)
+        3. Run backward modeling with cross-correlation
+
+        Parameters
+        ----------
+        total_memory : int
+            Total GPU memory available (MiB)
+        memory_merge : int
+            Memory reserved for other processes (MiB)
+        backwardmodel_method : str
+            'cross_correlation' or 'convolution'
+        """
+        estimated_v = self._estimate_or_fix_velocity()
+
         CFL = 0.8
-        #isnap = self.isnap
         absorbing_frame = self.absorbing_frame
 
-        flag = 99 # is simulation still running ?? -> 1: yes, 0: no
+        flag = 99
         print('\nstart forward modeling')
         while flag:
-            CFL *= 0.5 # decrease the CFL to avoid the error
-            flag = 0 # reset the flag
+            CFL *= 0.5
+            flag = 0
 
-            dx, dz, nx, nz, rho, vs, vp = self.__set_conditions_for_fwbw_modeling(estimated_v, CFL, absorbing_frame)
-            fs = self.fs
-            nt = self.nt
-            receiver_loc = self.receiver_loc
-            wavelet_u = self.source_u
-            wavelet_v = self.source_v
-            wavelet_w = self.source_w
-            observed_u = self.observed_u
-            observed_v = self.observed_v
-            observed_w = self.observed_w
-            receivers_height = self.receivers_height
+            dx, dz, nx, nz, rho, vs, vp = self.__set_conditions_for_fwbw_modeling(
+                estimated_v, CFL, absorbing_frame)
+            isnap = (self.isnap if self.debug
+                     else self.__set_isnap_for_allocated_memory(
+                         total_memory, memory_merge, nx, nz, self.nt))
 
-            receiver_loc_step = []
-            offset = 2*absorbing_frame
-            for loc in self.receiver_loc: 
-                receiver_loc_step.append([int(loc/dx+offset), 1])
-            src_loc_step = [[int(self.source_loc/dx+offset), 1]]
-            surface_matrix = cp.ones((nx, nz), dtype=cp.float32)
-            height_array = cp.zeros((nx), dtype=cp.float32)
-            steepness_array = cp.zeros_like(height_array) # 0 steepness in the boundary
-            if receivers_height is not None:
-                # get receiver_height_steps
-                receivers_height_step = -1 * cp.ones_like(receivers_height) * receivers_height / dz
-                
-                for i,locstep in enumerate(receiver_loc_step):
-                    heightstep = receivers_height_step[i]
-                    receiver_loc_step[i][1] = int(heightstep)
-                    # side boundary condition
-                    if i == 0:
-                        surface_matrix[:locstep[0],:heightstep] = 0
-                        height_array[:locstep[0]] = heightstep
-
-                    if i > 0:
-                        next_locstep = receiver_loc_step[i][0]
-                        locstep = receiver_loc_step[i-1][0]
-                        next_heightstep = receivers_height_step[i]
-                        heightstep = receivers_height_step[i-1]
-                        for ix in range(locstep, next_locstep):
-                            lean = (next_heightstep - heightstep) / (next_locstep - locstep)
-                            width = (ix - locstep)
-                            height_ix = lean * width + heightstep
-                            surface_matrix[ix,:int(height_ix)] = 0
-                            height_array[ix] = height_ix
-                
-                height_array[receiver_loc_step[-1][0]:] = receivers_height_step[-1]
-                surface_matrix[receiver_loc_step[-1][0]:, :int(receivers_height_step[-1])] = 0
-
-                self.height_array = height_array
-
-                ## make steepness array
-                for i in range(1, len(height_array)-1):
-                    steepness_array[i] = (height_array[i+1] - height_array[i-1])*dz / dx
-                self.steepness_array = steepness_array
-
-                if self.debug:
-                    plt.plot(height_array.get())
-                    plt.title('Surface Shape')
-                    plt.show()
-
-                    plt.imshow(surface_matrix.get().T)
-                    plt.title('Surface Matrix')
-                    plt.show()
-
-                self.surface_matrix = surface_matrix
-                # set source location_steps
-                src_loc_ind = src_loc_step[0][0]
-                source_height_step = height_array[src_loc_ind]
-                src_loc_step[0][1] = int(source_height_step + 1 )# source is upper than the receiver
-
+            receiver_loc_step, src_loc_step, surface_matrix, steepness_array = \
+                self._build_surface_geometry(dx, dz, nx, nz, absorbing_frame)
             self.src_loc_step = src_loc_step
-            # calcurate memory for
-            isnap = self.isnap if self.debug else self.__set_isnap_for_allocated_memory(total_memory, memory_merge, nx, nz, nt)
-            # forward modeling
-            _fw = fw.forward_modeling(nx = nx,
-                                       nz = nz,
-                                       dx = dx,
-                                       dz = dz,
-                                       nt = nt,
-                                       fs = fs,
-                                       vs = vs,
-                                       vp = vp,
-                                       rho = rho,
-                                       absorbing_frame = absorbing_frame,
-                                       src_loc = src_loc_step,   
-                                       wavelet_u = wavelet_u,
-                                       wavelet_v = wavelet_v,
-                                       wavelet_w = wavelet_w,
-                                       receiver_loc = receiver_loc_step,
-                                       isnap = isnap,
-                                       receivers_height = receivers_height,
-                                       surface_matrix = surface_matrix,
-                                       steepness_array = steepness_array
-                                       )
-            flag = _fw.run(show=self.debug,save=True) # if error, run returns 1 or 2 ro 3
 
+            flag, _fw = self._run_forward(
+                nx, nz, dx, dz, self.nt, isnap,
+                vs, vp, rho, absorbing_frame,
+                src_loc_step, receiver_loc_step,
+                surface_matrix, steepness_array)
             if flag:
                 continue
-            else:
-                print('The forward modeling is safe. pass to the backward modeling.')
-                pass
-            # backward modeling
-            _bw = bk.backward_modeling(nx = nx,
-                                        nz = nz,
-                                        dx = dx,
-                                        dz = dz,
-                                        nt = nt,
-                                        fs = fs,
-                                        vs = vs,
-                                        vp = vp,
-                                        rho = rho,
-                                        absorbing_frame = absorbing_frame,
-                                        src_loc = src_loc_step,
-                                        observed_data_u = observed_u,
-                                        observed_data_v = observed_v,
-                                        observed_data_w = observed_w,
-                                        receiver_loc = receiver_loc_step,
-                                        isnap = _fw.isnaps,
-                                        receivers_height = receivers_height,
-                                        surface_matrix = surface_matrix,
-                                        steepness_array = steepness_array
-                                        ) # isnap is 
-            flag = _bw.run_calc(show = self.debug,
-                                import_fwdata_u = _fw.u_save,
-                                import_fwdata_v = _fw.v_save,
-                                import_fwdata_w = _fw.w_save,
-                                isnaps = _fw.isnaps,
-                                save = False,
-                                method =  backwardmodel_method,
-                                )
+            print('The forward modeling is safe. pass to the backward modeling.')
 
+            flag, _bw = self._run_backward(
+                nx, nz, dx, dz, self.nt,
+                vs, vp, rho, absorbing_frame,
+                src_loc_step, receiver_loc_step,
+                surface_matrix, steepness_array,
+                _fw, backwardmodel_method)
             if flag:
                 continue
-            else:
-                print('\nThe backward modeling is safe. calcurated the cross-correlation.')
-                pass
+            print('\nThe backward modeling is safe. calculated the cross-correlation.')
 
         print(f'\nThe simulation is finished.')
         print(f'The estimated velocity = {estimated_v}m/s')
@@ -343,7 +346,7 @@ class ReverseTimeMigration:
         self.dz = dz
         self.nx = nx
         self.nz = nz
-        self.offset = offset * dx
+        self.offset = 2 * absorbing_frame * dx
         self.CFL = CFL
     
     def save_result(self, dir, savename):
@@ -357,7 +360,6 @@ class ReverseTimeMigration:
         zmin = float(zmin)
         zmax = float(zmax)
         surface_matrix = self.surface_matrix if hasattr(self, 'surface_matrix') else None
-        import os
         if not os.path.exists(dir):
             os.makedirs(dir)
         np.savez_compressed(dir + savename,
@@ -400,13 +402,13 @@ class ReverseTimeMigration:
         vmap = self.image_v.get().T
         wmap = self.image_w.get().T
         if mean:
-            umap = umap - cp.mean(umap)
-            vmap = vmap - cp.mean(vmap)
-            wmap = wmap - cp.mean(wmap)
-        
-        umax = cp.max(umap) if cp.max(umap) > -cp.min(umap) else -cp.min(umap)
-        vmax = cp.max(vmap) if cp.max(vmap) > -cp.min(vmap) else -cp.min(vmap)
-        wmax = cp.max(wmap) if cp.max(wmap) > -cp.min(wmap) else -cp.min(wmap)
+            umap = umap - np.mean(umap)
+            vmap = vmap - np.mean(vmap)
+            wmap = wmap - np.mean(wmap)
+
+        umax = np.max(umap) if np.max(umap) > -np.min(umap) else -np.min(umap)
+        vmax = np.max(vmap) if np.max(vmap) > -np.min(vmap) else -np.min(vmap)
+        wmax = np.max(wmap) if np.max(wmap) > -np.min(wmap) else -np.min(wmap)
 
         # 図とサブプロットを作成
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
