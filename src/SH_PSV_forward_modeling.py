@@ -17,13 +17,16 @@
 # 1. 順方向モデリング
 import time
 
+import numpy as np
 import cupy as cp  # CuPy is imported as cp for compatibility
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 import matplotlib
 matplotlib.use('Agg')
 import os
 
 from wave_simulation_base import WaveSimulation
+from optimal_FD_operator import optimize_c
 
 """
     i,j               i+1,j
@@ -38,32 +41,90 @@ myz |                  |
     o------------------o
 i,j+1                  i+1,j+1
 """
+_DERIVATIVE_STYLE_MAP: dict[str, int] = {
+    '2points':   2,   # 2-point staggered (order-2)
+    'L6stencil': 6,   # 6th-order staggered (L=6)
+}
+
+
 class forward_modeling(WaveSimulation):
     """
-    kwargs:
-    nx:int   x方向のグリッド数
-    nz:int   z方向のグリッド数
-    dx:float x方向のグリッド間隔
-    dz:float z方向のグリッド間隔
-    nt:int   シミュレーション時間ステップ数
-    fs:float サンプリング周波数
-    vs:cp.array S波速度
-    rho:cp.array 密度
-    absorbing_frame:int 吸収境界の幅
-    src_loc:list 震源の位置  [[i1,j1],[i2,j2],...]
-    wavelet:cp.array 震源波形
-    receiver_loc:list 受信機の位置 [[i1,j1],[i2,j2],...]
-
-    isnap:int 途中経過の表示ステップ数 default:10
-    order:int 空間微分のオーダー(2 or 3) dedault:2
+    Parameters
+    ----------
+    nx : int
+        x方向のグリッド数
+    nz : int
+        z方向のグリッド数
+    dx : float
+        x方向のグリッド間隔
+    dz : float
+        z方向のグリッド間隔
+    nt : int
+        シミュレーション時間ステップ数
+    fs : float
+        サンプリング周波数
+    receiver_loc : list
+        受信機の位置 [[i1,j1],[i2,j2],...]
+    src_loc : list, optional
+        震源の位置 [[i1,j1],[i2,j2],...]  default: [[nx//2, 0]]
+    absorbing_frame : int, optional
+        吸収境界の幅  default: 60
+    isnap : int, optional
+        途中経過の表示ステップ数  default: 10
+    derivative_style : str, optional
+        空間微分スキームの選択  '2points' (default) or 'L6stencil'
+        '2points'   — 2点スタガード差分 (order-2)
+        'L6stencil' — 6次精度スタガード差分 (L=6)
+    fmax : float, optional
+        最大周波数 [Hz]  default: 50.0
+        'L6stencil' 選択時に λmin = vs_min / fmax を計算し、
+        optimal_FD_operator.optimize_c() で分散誤差を最小化した係数を
+        自動設定する。fd_coefficients を明示した場合はそちらが優先される。
+    **kwargs
+        追加パラメータ (vs, vp, rho, wavelet_u, wavelet_v, wavelet_w,
+        f0, receivers_height, surface_matrix, steepness_array 等)
+        はすべてキーワード引数として渡す。
     """
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.wavelet_u = kwargs['wavelet_u'] if 'wavelet_u' in kwargs else None
-        self.wavelet_v = kwargs['wavelet_v'] if 'wavelet_v' in kwargs else None
-        self.wavelet_w = kwargs['wavelet_w'] if 'wavelet_w' in kwargs else None
-        self.f0 = kwargs['f0'] if 'f0' in kwargs else None
+    def __init__(
+        self,
+        nx: int,
+        nz: int,
+        dx: float,
+        dz: float,
+        nt: int,
+        fs: float,
+        receiver_loc: list,
+        src_loc: list | None = None,
+        absorbing_frame: int = 60,
+        isnap: int = 10,
+        derivative_style: str = '2points',
+        fmax: float = 50.0,
+        **kwargs,
+    ) -> None:
+        if derivative_style not in _DERIVATIVE_STYLE_MAP:
+            raise ValueError(
+                f"derivative_style must be one of {list(_DERIVATIVE_STYLE_MAP)}, "
+                f"got {derivative_style!r}"
+            )
+        kwargs.pop('order', None)  # derivative_style takes precedence over order
+        super_kwargs: dict = dict(
+            nx=nx, nz=nz, dx=dx, dz=dz, nt=nt, fs=fs,
+            receiver_loc=receiver_loc,
+            absorbing_frame=absorbing_frame,
+            isnap=isnap,
+            order=_DERIVATIVE_STYLE_MAP[derivative_style],
+            **kwargs,
+        )
+        if src_loc is not None:
+            super_kwargs['src_loc'] = src_loc
+        super().__init__(**super_kwargs)
+        self.derivative_style: str = derivative_style
+        self.fmax: float = fmax
+        self.wavelet_u = kwargs.get('wavelet_u')
+        self.wavelet_v = kwargs.get('wavelet_v')
+        self.wavelet_w = kwargs.get('wavelet_w')
+        self.f0 = kwargs.get('f0')
 
     def initialize(self):
         self.seismogram_u = cp.zeros((len(self.receiver_loc), self.nt), dtype=cp.float32)
@@ -176,8 +237,10 @@ class forward_modeling(WaveSimulation):
             self._update_vel_order2()
         elif order == 3:
             self._update_vel_order3()
+        elif order == 6:
+            self._launch_vel_kernel_order6(1.0)
         else:
-            raise ValueError('order must be 2 or 3')
+            raise ValueError('order must be 2, 3, or 6')
         self.apply_absorb(self.u)
         self.apply_absorb(self.v)
         self.apply_absorb(self.w)
@@ -187,8 +250,10 @@ class forward_modeling(WaveSimulation):
             self._update_str_order2()
         elif order == 3:
             self._update_str_order3()
+        elif order == 6:
+            self._launch_str_kernel_order6(1.0)
         else:
-            raise ValueError('order must be 2 or 3')
+            raise ValueError('order must be 2, 3, or 6')
         self.apply_absorb(self.sxx)
         self.apply_absorb(self.sxz)
         self.apply_absorb(self.szz)
@@ -261,16 +326,30 @@ class forward_modeling(WaveSimulation):
         src = -2. * (time - t0) * (f0 ** 2) * (cp.exp(-(f0 ** 2) * (time - t0) ** 2))
         return src
 
-    def run(self, show=True, save=False):
+    def run(
+        self,
+        show: bool = True,
+        save: bool = False,
+        fd_coefficients: tuple[float, float, float] | None = None,
+    ) -> int:
         """
         run forward modeling
-        return:
-             0: simulation was conducted safely,
-             1: u faced infinite,
-             2: v faced infinite,
-             3: w faced infinite.
-        show: bool, default True, if True, show wavefield
-        save: bool, default False, if True, save wavefield
+
+        Parameters
+        ----------
+        show : bool
+            True の場合、wavefield をリアルタイム表示する。
+        save : bool
+            True の場合、wavefield スナップショットを float16 で保存する。
+        fd_coefficients : tuple[float, float, float] | None
+            L=6 stencil の係数 (c1, c2, c3) を上書きする場合に指定。
+            None の場合は Taylor 6次係数 (75/64, -25/384, 3/640) を使用。
+            optimal_FD_operator.optimize_c() で得た係数をここに渡せる。
+
+        Returns
+        -------
+        int
+            0: 正常終了, 1: u が発散, 2: v が発散, 3: w が発散
         """
         cp.get_default_memory_pool().free_all_blocks()
 
@@ -280,10 +359,27 @@ class forward_modeling(WaveSimulation):
             self.w_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
             self.isnaps = cp.zeros(self.nt // self.isnap, dtype=cp.int32)
 
+        # L6stencil: update grid spacing to λmin/8 before initialize() so that
+        # _compile_fdm_kernels() picks up the correct inv_dx / inv_dz
+        _lambda_min: float | None = None
+        if self.derivative_style == 'L6stencil':
+            vmin = float(self.vs.min())
+            _lambda_min = vmin / self.fmax
+            self.dx = _lambda_min / 8.0
+            self.dz = _lambda_min / 8.0
+
         self.initialize()
+
+        if fd_coefficients is not None:
+            self._c1, self._c2, self._c3 = (np.float32(c) for c in fd_coefficients)
+        elif _lambda_min is not None:
+            _, res, _ = optimize_c(_lambda_min, self.dx)
+            self._c1, self._c2, self._c3 = (np.float32(c) for c in res.x)
+            print(f'L6stencil: λmin={_lambda_min:.1f}m, dx={self.dx:.2f}m, '
+                  f'c=({float(self._c1):.6f}, {float(self._c2):.6f}, {float(self._c3):.6f})')
         if show:
             self.plot_wavefield()
-        for it in range(self.nt):
+        for it in tqdm(range(self.nt), desc='Forward modeling', unit='step'):
 
             self.set_boundary_condition()
             self.update_vel(order=self.order)
@@ -381,6 +477,7 @@ class forward_modeling(WaveSimulation):
 
         it = 0
         step_time_ms = 0.0
+        pbar = tqdm(total=self.nt, desc='Forward modeling (GUI)', unit='step')
 
         while gui.is_running():
             if gui.playing and it < self.nt:
@@ -423,16 +520,21 @@ class forward_modeling(WaveSimulation):
 
                 if it % 100 == 0:
                     if not cp.all(cp.isfinite(self.u)):
+                        pbar.close()
                         gui.cleanup()
                         return 1
                     if not cp.all(cp.isfinite(self.v)):
+                        pbar.close()
                         gui.cleanup()
                         return 2
                     if not cp.all(cp.isfinite(self.w)):
+                        pbar.close()
                         gui.cleanup()
                         return 3
 
                 it += 1
+                pbar.update(1)
+                pbar.set_postfix(ms=f'{step_time_ms:.1f}')
 
                 if it >= self.nt:
                     # Simulation finished — push final status and stay open
@@ -440,6 +542,7 @@ class forward_modeling(WaveSimulation):
 
             gui.render_frame()
 
+        pbar.close()
         gui.cleanup()
         print('end forward modeling (GUI)')
         return 0

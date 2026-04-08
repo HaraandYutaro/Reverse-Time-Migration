@@ -19,6 +19,7 @@ import time
 
 import cupy as cp  # CuPy is imported as cp for compatibility
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 plt.style.use('fast')
 
 from wave_simulation_base import WaveSimulation
@@ -121,8 +122,11 @@ class backward_modeling(WaveSimulation):
             self._update_vel_order2()
         elif order == 3:
             self._update_vel_order3()
+        elif order == 6:
+            # Backward time: velocity uses forward spatial stencil (str-type) with sign=-1
+            self._launch_str_kernel_order6(-1.0)
         else:
-            raise ValueError('order must be 2 or 3')
+            raise ValueError('order must be 2, 3, or 6')
         self.apply_absorb(self.u)
         self.apply_absorb(self.v)
         self.apply_absorb(self.w)
@@ -132,8 +136,11 @@ class backward_modeling(WaveSimulation):
             self._update_str_order2()
         elif order == 3:
             self._update_str_order3()
+        elif order == 6:
+            # Backward time: stress uses backward spatial stencil (vel-type) with sign=-1
+            self._launch_vel_kernel_order6(-1.0)
         else:
-            raise ValueError('order must be 2 or 3')
+            raise ValueError('order must be 2, 3, or 6')
         self.apply_absorb(self.sxx)
         self.apply_absorb(self.sxz)
         self.apply_absorb(self.szz)
@@ -229,7 +236,7 @@ class backward_modeling(WaveSimulation):
         src_i = src_loc_arr[:, 0]
         src_j = src_loc_arr[:, 1]
 
-        for it in range(self.nt):
+        for it in tqdm(range(self.nt), desc='Backward modeling', unit='step'):
             self.set_boundary_condition()
 
             t = self.nt - it - 1  # real timestep
@@ -311,7 +318,7 @@ class backward_modeling(WaveSimulation):
         # Precompute snapshot lookup on CPU to avoid GPU linear search every step
         isnap_dict = {int(s): idx for idx, s in enumerate(isnaps.get())}
 
-        for it in range(self.nt):
+        for it in tqdm(range(self.nt), desc='Backward modeling (calc)', unit='step'):
             # free surface boundary condition Z=0
             self.set_boundary_condition()
 
@@ -420,6 +427,7 @@ class backward_modeling(WaveSimulation):
 
         it = 0
         step_time_ms = 0.0
+        pbar = tqdm(total=self.nt, desc='Backward modeling (GUI calc)', unit='step')
 
         while gui.is_running():
             if gui.playing and it < self.nt:
@@ -471,21 +479,27 @@ class backward_modeling(WaveSimulation):
 
                 if it % 100 == 0:
                     if not cp.all(cp.isfinite(self.u)):
+                        pbar.close()
                         gui.cleanup()
                         return 4
                     if not cp.all(cp.isfinite(self.v)):
+                        pbar.close()
                         gui.cleanup()
                         return 5
                     if not cp.all(cp.isfinite(self.w)):
+                        pbar.close()
                         gui.cleanup()
                         return 6
 
                 it += 1
+                pbar.update(1)
+                pbar.set_postfix(ms=f'{step_time_ms:.1f}')
                 if it >= self.nt:
                     gui.update_status(it, step_time_ms)
 
             gui.render_frame()
 
+        pbar.close()
         gui.cleanup()
         print('end backward modeling (GUI calc)')
         self.result_u = result_u
@@ -539,6 +553,7 @@ class backward_modeling(WaveSimulation):
 
         it = 0
         step_time_ms = 0.0
+        pbar = tqdm(total=self.nt, desc='Backward modeling (GUI)', unit='step')
 
         while gui.is_running():
             if gui.playing and it < self.nt:
@@ -573,22 +588,28 @@ class backward_modeling(WaveSimulation):
 
                 if it % 100 == 0:
                     if not cp.all(cp.isfinite(self.u)):
+                        pbar.close()
                         gui.cleanup()
                         return 4
                     if not cp.all(cp.isfinite(self.v)):
+                        pbar.close()
                         gui.cleanup()
                         return 5
                     if not cp.all(cp.isfinite(self.w)):
+                        pbar.close()
                         gui.cleanup()
                         return 6
 
                 it += 1
+                pbar.update(1)
+                pbar.set_postfix(ms=f'{step_time_ms:.1f}')
 
                 if it >= self.nt:
                     gui.update_status(it, step_time_ms)
 
             gui.render_frame()
 
+        pbar.close()
         gui.cleanup()
         print('end backward modeling (GUI)')
         return 0

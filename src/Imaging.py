@@ -25,7 +25,7 @@ import os
 
 vel = 120
 
-dir = f'example/results/v120/data/'
+dir = f'examples/results2/data/'
 dir_save = f'example/results/RTMimages/'
 if not os.path.exists(dir_save):
     os.makedirs(dir_save)

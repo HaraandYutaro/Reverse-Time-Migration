@@ -115,7 +115,7 @@ for npz_path in npzs_path_list:
                                 vmax = 300,
                                 vstep = 2000,
                                 v_fix = velocity,
-                                gui = True,
+                                gui = False,
                                 )
     RTM.run(total_memory = 20000, memory_merge = 4000)
 

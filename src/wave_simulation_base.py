@@ -127,6 +127,127 @@ void update_str_order2(
 '''
 
 
+_UPDATE_VEL_L6STENCIL_SRC = r'''
+/* L=6 staggered velocity update — backward stencil for stress derivatives
+ * df/dx at i   = (c1*(f[i]-f[i-1])   + c2*(f[i+1]-f[i-2]) + c3*(f[i+2]-f[i-3])) / dx
+ * Active range: i in [3, nx-3), j in [3, nz-3)
+ * c1, c2, c3 are passed as scalars (Taylor: 75/64, -25/384, 3/640)
+ */
+extern "C" __global__
+void update_vel_l6stencil(
+    float* __restrict__ u,
+    float* __restrict__ v,
+    float* __restrict__ w,
+    const float* __restrict__ sxx,
+    const float* __restrict__ szz,
+    const float* __restrict__ sxz,
+    const float* __restrict__ syx,
+    const float* __restrict__ syz,
+    const float* __restrict__ dt_over_rho_u,
+    const float* __restrict__ dt_over_rho_w,
+    const float* __restrict__ dt_over_rho,
+    const float inv_dx, const float inv_dz,
+    const float sign,
+    const float c1, const float c2, const float c3,
+    const int nx, const int nz
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < 3 || i >= nx - 3 || j < 3 || j >= nz - 3) return;
+
+    int ij = i * nz + j;
+
+    /* Backward stencil in x (uses i-3..i+2) */
+    #define BWD_X(f) ( c1*((f)[ij]         - (f)[(i-1)*nz+j]) \
+                     + c2*((f)[(i+1)*nz+j] - (f)[(i-2)*nz+j]) \
+                     + c3*((f)[(i+2)*nz+j] - (f)[(i-3)*nz+j]) ) * inv_dx
+
+    /* Backward stencil in z (uses j-3..j+2) */
+    #define BWD_Z(f) ( c1*((f)[ij]          - (f)[i*nz+(j-1)]) \
+                     + c2*((f)[i*nz+(j+1)]  - (f)[i*nz+(j-2)]) \
+                     + c3*((f)[i*nz+(j+2)]  - (f)[i*nz+(j-3)]) ) * inv_dz
+
+    /* P-SV: u */
+    u[ij] += sign * (BWD_X(sxx) + BWD_Z(sxz)) * dt_over_rho_u[ij];
+
+    /* P-SV: w */
+    w[ij] += sign * (BWD_X(sxz) + BWD_Z(szz)) * dt_over_rho_w[ij];
+
+    /* SH: v */
+    v[ij] += sign * (BWD_X(syx) + BWD_Z(syz)) * dt_over_rho[ij];
+
+    #undef BWD_X
+    #undef BWD_Z
+}
+'''
+
+_UPDATE_STR_L6STENCIL_SRC = r'''
+/* L=6 staggered stress update — forward stencil for velocity derivatives
+ * df/dx at i+1/2 = (c1*(f[i+1]-f[i])   + c2*(f[i+2]-f[i-1]) + c3*(f[i+3]-f[i-2])) / dx
+ * Active range: i in [3, nx-3), j in [3, nz-3)
+ * c1, c2, c3 are passed as scalars (Taylor: 75/64, -25/384, 3/640)
+ */
+extern "C" __global__
+void update_str_l6stencil(
+    float* __restrict__ sxx,
+    float* __restrict__ szz,
+    float* __restrict__ sxz,
+    float* __restrict__ syx,
+    float* __restrict__ syz,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ w,
+    const float* __restrict__ lam,
+    const float* __restrict__ mu,
+    const float* __restrict__ mxz,
+    const float* __restrict__ myx,
+    const float* __restrict__ myz,
+    const float dt, const float inv_dx, const float inv_dz,
+    const float sign,
+    const float c1, const float c2, const float c3,
+    const int nx, const int nz
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (i < 3 || i >= nx - 3 || j < 3 || j >= nz - 3) return;
+
+    int ij = i * nz + j;
+
+    /* Forward stencil in x (uses i-2..i+3) */
+    #define FWD_X(f) ( c1*((f)[(i+1)*nz+j] - (f)[ij]) \
+                     + c2*((f)[(i+2)*nz+j] - (f)[(i-1)*nz+j]) \
+                     + c3*((f)[(i+3)*nz+j] - (f)[(i-2)*nz+j]) ) * inv_dx
+
+    /* Forward stencil in z (uses j-2..j+3) */
+    #define FWD_Z(f) ( c1*((f)[i*nz+(j+1)] - (f)[ij]) \
+                     + c2*((f)[i*nz+(j+2)] - (f)[i*nz+(j-1)]) \
+                     + c3*((f)[i*nz+(j+3)] - (f)[i*nz+(j-2)]) ) * inv_dz
+
+    /* P-SV */
+    float u_x = FWD_X(u);
+    float u_z = FWD_Z(u);
+    float w_x = FWD_X(w);
+    float w_z = FWD_Z(w);
+
+    float div  = u_x + w_z;
+    float sdt  = sign * dt;
+    float l_ij = lam[ij];
+    float m_ij = mu[ij];
+
+    sxx[ij] += sdt * (l_ij * div + 2.0f * m_ij * u_x);
+    szz[ij] += sdt * (l_ij * div + 2.0f * m_ij * w_z);
+    sxz[ij] += sdt * mxz[ij] * (u_z + w_x);
+
+    /* SH */
+    syx[ij] += sdt * myx[ij] * FWD_X(v);
+    syz[ij] += sdt * myz[ij] * FWD_Z(v);
+
+    #undef FWD_X
+    #undef FWD_Z
+}
+'''
+
+
 class WaveSimulation:
     """
     Base class for forward and backward elastic wave simulation.
@@ -253,9 +374,21 @@ class WaveSimulation:
 
         Must be called at the end of subclass initialize() after dt, rho_u,
         rho_w, rho, lam, mu, mxz, myx, myz are all set.
+
+        L=6 stencil coefficients (Taylor 6th-order defaults):
+            self._c1 = 75/64,  self._c2 = -25/384,  self._c3 = 3/640
+        Override these after calling initialize() to use optimised coefficients
+        (e.g. from optimal_FD_operator.optimize_c) before the time loop.
         """
-        self._vel_kernel = cp.RawKernel(_UPDATE_VEL_ORDER2_SRC, 'update_vel_order2')
-        self._str_kernel = cp.RawKernel(_UPDATE_STR_ORDER2_SRC, 'update_str_order2')
+        self._vel_kernel    = cp.RawKernel(_UPDATE_VEL_ORDER2_SRC,   'update_vel_order2')
+        self._str_kernel    = cp.RawKernel(_UPDATE_STR_ORDER2_SRC,   'update_str_order2')
+        self._vel_kernel_l6 = cp.RawKernel(_UPDATE_VEL_L6STENCIL_SRC, 'update_vel_l6stencil')
+        self._str_kernel_l6 = cp.RawKernel(_UPDATE_STR_L6STENCIL_SRC, 'update_str_l6stencil')
+
+        # Taylor 6th-order staggered FD coefficients (c1+3c2+5c3 = 1)
+        self._c1 = np.float32(75.0  / 64.0)
+        self._c2 = np.float32(-25.0 / 384.0)
+        self._c3 = np.float32(3.0   / 640.0)
 
         # Precompute dt/rho so the kernel avoids per-thread division
         self._dt_over_rho_u = (self.dt / self.rho_u).astype(cp.float32)
@@ -269,9 +402,11 @@ class WaveSimulation:
         self._nx_i32 = np.int32(self.nx)
         self._nz_i32 = np.int32(self.nz)
 
-        # Grid / block for interior points [1, nx-1) x [1, nz-1)
+        # Grid / block for order-2 interior points [1, nx-1) x [1, nz-1)
         self._block = (16, 16)
         self._grid = ((self.nx - 2 + 15) // 16, (self.nz - 2 + 15) // 16)
+        # Grid for order-6: boundary guard is inside the kernel (i>=3, i<nx-3)
+        self._grid_o6 = ((self.nx + 15) // 16, (self.nz + 15) // 16)
 
     def _launch_vel_kernel(self, sign, a_di, b_di, a_dj, b_dj):
         self._vel_kernel(
@@ -298,6 +433,31 @@ class WaveSimulation:
              np.float32(sign),
              np.int32(a_di), np.int32(b_di),
              np.int32(a_dj), np.int32(b_dj),
+             self._nx_i32, self._nz_i32))
+
+    def _launch_vel_kernel_order6(self, sign):
+        self._vel_kernel_l6(
+            self._grid_o6, self._block,
+            (self.u, self.v, self.w,
+             self.sxx, self.szz, self.sxz,
+             self.syx, self.syz,
+             self._dt_over_rho_u, self._dt_over_rho_w, self._dt_over_rho_v,
+             self._inv_dx, self._inv_dz,
+             np.float32(sign),
+             self._c1, self._c2, self._c3,
+             self._nx_i32, self._nz_i32))
+
+    def _launch_str_kernel_order6(self, sign):
+        self._str_kernel_l6(
+            self._grid_o6, self._block,
+            (self.sxx, self.szz, self.sxz,
+             self.syx, self.syz,
+             self.u, self.v, self.w,
+             self.lam, self.mu, self.mxz,
+             self.myx, self.myz,
+             self._dt_f32, self._inv_dx, self._inv_dz,
+             np.float32(sign),
+             self._c1, self._c2, self._c3,
              self._nx_i32, self._nz_i32))
 
     def apply_absorb(self, field):
