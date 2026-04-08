@@ -77,7 +77,7 @@ class ReverseTimeMigration:
         self.vmax = kwargs['vmax'] if 'vmax' in kwargs else 500.
         self.vstep = kwargs['vstep'] if 'vstep' in kwargs else 10
         self.v_fix = kwargs['v_fix'] if 'v_fix' in kwargs else None
-        self.debug = kwargs['debug'] if 'debug' in kwargs else False
+        self.gui = kwargs['gui'] if 'gui' in kwargs else False
         self.receivers_height = kwargs['receivers_height'] if 'receivers_height' in kwargs else None 
         receivers_height = self.receivers_height - cp.max(self.receivers_height) if self.receivers_height is not None else None
         self.receivers_height = receivers_height  # receivers_height is negative value. 0 is the highest point
@@ -207,7 +207,7 @@ class ReverseTimeMigration:
             steepness_array[1:-1] = (height_array[2:] - height_array[:-2]) * dz / dx
             self.steepness_array = steepness_array
 
-            if self.debug:
+            if self.gui:
                 plt.plot(height_array.get())
                 plt.title('Surface Shape')
                 plt.show()
@@ -242,7 +242,7 @@ class ReverseTimeMigration:
             steepness_array=steepness_array,
         )
         cp.get_default_memory_pool().free_all_blocks()
-        flag = _fw.run_gui(save=True) if self.debug else _fw.run(show=False, save=True)
+        flag = _fw.run_gui(save=True) if self.gui else _fw.run(show=False, save=True)
         return flag, _fw
 
     def _run_backward(self, nx, nz, dx, dz, nt,
@@ -267,8 +267,14 @@ class ReverseTimeMigration:
             surface_matrix=surface_matrix,
             steepness_array=steepness_array,
         )
-        if self.debug:
-            flag = _bw.run_gui()
+        if self.gui:
+            flag = _bw.run_gui_calc(
+                import_fwdata_u=_fw.u_save,
+                import_fwdata_v=_fw.v_save,
+                import_fwdata_w=_fw.w_save,
+                isnaps=_fw.isnaps,
+                method=backwardmodel_method,
+            )
         else:
             flag = _bw.run_calc(
                 show=False,
@@ -310,7 +316,7 @@ class ReverseTimeMigration:
 
             dx, dz, nx, nz, rho, vs, vp = self.__set_conditions_for_fwbw_modeling(
                 estimated_v, CFL, absorbing_frame)
-            isnap = (self.isnap if self.debug
+            isnap = (self.isnap if self.gui
                      else self.__set_isnap_for_allocated_memory(
                          total_memory, memory_merge, nx, nz, self.nt))
 
@@ -491,7 +497,7 @@ if __name__ == '__main__':
                                 vmax = 300,
                                 vstep = 2000,
                                 v_fix = 200,
-                                debug = False,
+                                gui = False,
                                 )
     RTM.run(total_memory = 24000, memory_merge = 4000)
     RTM.show_result(cmap = 'seismic', mean = True)

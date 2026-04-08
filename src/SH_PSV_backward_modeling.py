@@ -113,6 +113,9 @@ class backward_modeling(WaveSimulation):
 
         self.maxAD = 2 ** 23  # ADC full-scale count for raw data scaling
 
+        # Compile fused CUDA kernels for order-2 FDM updates
+        self._compile_fdm_kernels()
+
     def update_vel(self, order):
         if order == 2:
             self._update_vel_order2()
@@ -120,9 +123,9 @@ class backward_modeling(WaveSimulation):
             self._update_vel_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.u *= self.absorb_coeff
-        self.v *= self.absorb_coeff
-        self.w *= self.absorb_coeff
+        self.apply_absorb(self.u)
+        self.apply_absorb(self.v)
+        self.apply_absorb(self.w)
 
     def update_str(self, order):
         if order == 2:
@@ -131,27 +134,15 @@ class backward_modeling(WaveSimulation):
             self._update_str_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.sxx *= self.absorb_coeff
-        self.sxz *= self.absorb_coeff
-        self.szz *= self.absorb_coeff
-        self.syx *= self.absorb_coeff
-        self.syz *= self.absorb_coeff
+        self.apply_absorb(self.sxx)
+        self.apply_absorb(self.sxz)
+        self.apply_absorb(self.szz)
+        self.apply_absorb(self.syx)
+        self.apply_absorb(self.syz)
 
     def _update_vel_order2(self):
-        # P-SV wave update:
-        sxx_x = (self.sxx[2:, 1:-1] - self.sxx[1:-1, 1:-1]) / self.dx
-        szz_z = (self.szz[1:-1, 2:] - self.szz[1:-1, 1:-1]) / self.dz
-        sxz_x = (self.sxz[2:, 1:-1] - self.sxz[1:-1, 1:-1]) / self.dx
-        sxz_z = (self.sxz[1:-1, 2:] - self.sxz[1:-1, 1:-1]) / self.dz
-        du = -(sxx_x + sxz_z) * (self.dt / self.rho_u[1:-1, 1:-1])
-        dw = -(sxz_x + szz_z) * (self.dt / self.rho_w[1:-1, 1:-1])
-        self.u[1:-1, 1:-1] += du
-        self.w[1:-1, 1:-1] += dw
-        # SH wave update:
-        syx_x = (self.syx[2:, 1:-1] - self.syx[1:-1, 1:-1]) / self.dx
-        syz_z = (self.syz[1:-1, 2:] - self.syz[1:-1, 1:-1]) / self.dz
-        dv = -(syx_x + syz_z) * (self.dt / self.rho[1:-1, 1:-1])
-        self.v[1:-1, 1:-1] += dv
+        # Backward: forward-difference stencil, sign = -1
+        self._launch_vel_kernel(-1.0, 1, 0, 1, 0)
 
     def _update_vel_order3(self):
         # インデックス範囲を設定
@@ -181,25 +172,8 @@ class backward_modeling(WaveSimulation):
         self.v[i_start:i_end, j_start:j_end] += dv
 
     def _update_str_order2(self):
-        # P-SV wave update:
-        u_x = (self.u[1:-1, 1:-1] - self.u[0:-2, 1:-1]) / self.dx
-        u_z = (self.u[1:-1, 1:-1] - self.u[1:-1, 0:-2]) / self.dz
-        w_x = (self.w[1:-1, 1:-1] - self.w[0:-2, 1:-1]) / self.dx
-        w_z = (self.w[1:-1, 1:-1] - self.w[1:-1, 0:-2]) / self.dz
-        dsxx = -self.dt * (self.lam[1:-1, 1:-1] * (u_x + w_z) + 2.0 * self.mu[1:-1, 1:-1] * u_x)
-        dszz = -self.dt * (self.lam[1:-1, 1:-1] * (u_x + w_z) + 2.0 * self.mu[1:-1, 1:-1] * w_z)
-        dsxz = -self.dt * (self.mxz[1:-1, 1:-1] * (u_z + w_x))
-        self.sxx[1:-1, 1:-1] += dsxx
-        self.szz[1:-1, 1:-1] += dszz
-        self.sxz[1:-1, 1:-1] += dsxz
-
-        # SH wave update:
-        v_x = (self.v[1:-1, 1:-1] - self.v[0:-2, 1:-1]) / self.dx
-        v_z = (self.v[1:-1, 1:-1] - self.v[1:-1, 0:-2]) / self.dz
-        dsyx = -self.dt * self.myx[1:-1, 1:-1] * v_x
-        dsyz = -self.dt * self.myz[1:-1, 1:-1] * v_z
-        self.syx[1:-1, 1:-1] += dsyx
-        self.syz[1:-1, 1:-1] += dsyz
+        # Backward: backward-difference stencil, sign = -1
+        self._launch_str_kernel(-1.0, 0, -1, 0, -1)
 
     def _update_str_order3(self):
         # インデックス範囲を設定
@@ -277,12 +251,13 @@ class backward_modeling(WaveSimulation):
                 if show:
                     self.display_wavefield()
 
-            if not cp.all(cp.isfinite(self.u)):
-                return 4
-            if not cp.all(cp.isfinite(self.v)):
-                return 5
-            if not cp.all(cp.isfinite(self.w)):
-                return 6
+            if it % 100 == 0:
+                if not cp.all(cp.isfinite(self.u)):
+                    return 4
+                if not cp.all(cp.isfinite(self.v)):
+                    return 5
+                if not cp.all(cp.isfinite(self.w)):
+                    return 6
 
         print('end backward modeling')
         return 0
@@ -333,6 +308,9 @@ class backward_modeling(WaveSimulation):
         src_i = src_loc_array[:, 0]
         src_j = src_loc_array[:, 1]
 
+        # Precompute snapshot lookup on CPU to avoid GPU linear search every step
+        isnap_dict = {int(s): idx for idx, s in enumerate(isnaps.get())}
+
         for it in range(self.nt):
             # free surface boundary condition Z=0
             self.set_boundary_condition()
@@ -354,9 +332,8 @@ class backward_modeling(WaveSimulation):
             self.synsrc_v[:, t] = self.v[src_i, src_j]
             self.synsrc_w[:, t] = self.w[src_i, src_j]
 
-            snapt = t
-            if snapt in isnaps:
-                indices = cp.where(isnaps == snapt)[0][0]
+            if t in isnap_dict:
+                indices = isnap_dict[t]
                 if method == 'cross_correlation':
                     delta_result_u = (import_fwdata_u[:, :, indices] * self.u[:, :]).squeeze()
                     delta_result_v = (import_fwdata_v[:, :, indices] * self.v[:, :]).squeeze()
@@ -376,17 +353,141 @@ class backward_modeling(WaveSimulation):
                     sm_u = import_fwdata_u[:, :, indices].squeeze() * self.u[:, :]
                     sm_v = import_fwdata_v[:, :, indices].squeeze() * self.v[:, :]
                     sm_w = import_fwdata_w[:, :, indices].squeeze() * self.w[:, :]
-                    self.display_wavefield(u_cpu=sm_u.get(), v_cpu=sm_v.get(), w_cpu=sm_w.get(), suptitle=f'fw x bw at {snapt}timestep')
+                    self.display_wavefield(u_cpu=sm_u.get(), v_cpu=sm_v.get(), w_cpu=sm_w.get(), suptitle=f'fw x bw at {t}timestep')
 
-            # check if the wavefield is infinite: flag
-            if not cp.all(cp.isfinite(self.u)):
-                return 4
-            if not cp.all(cp.isfinite(self.v)):
-                return 5
-            if not cp.all(cp.isfinite(self.w)):
-                return 6
+            # check if the wavefield is infinite: flag (every 100 steps)
+            if it % 100 == 0:
+                if not cp.all(cp.isfinite(self.u)):
+                    return 4
+                if not cp.all(cp.isfinite(self.v)):
+                    return 5
+                if not cp.all(cp.isfinite(self.w)):
+                    return 6
 
         print('end backward modeling')
+        self.result_u = result_u
+        self.result_v = result_v
+        self.result_w = result_w
+        return 0
+
+    def run_gui_calc(self, import_fwdata_u: cp.array, import_fwdata_v: cp.array, import_fwdata_w: cp.array, isnaps: cp.array, method='cross_correlation'):
+        """
+        Run backward modeling with correlation calculation and Dear PyGui interactive viewer.
+
+        Combines run_gui (interactive GPU viewer) with run_calc (cross-correlation).
+        Snapshot steps show the fw×bw correlation image; other steps show the raw wavefield.
+
+        Parameters
+        ----------
+        import_fwdata_u/v/w : cp.array  (nx, nz, n_snaps)
+            Forward modeling wavefield snapshots.
+        isnaps : cp.array
+            Timestep indices at which snapshots were saved.
+        method : str
+            'cross_correlation' or 'convolution'.
+
+        Returns
+        -------
+        0  : simulation completed safely
+        4  : u diverged
+        5  : v diverged
+        6  : w diverged
+
+        On success, sets self.result_u / result_v / result_w.
+        """
+        from visualizer import SimulationGUI
+
+        cp.get_default_memory_pool().free_all_blocks()
+        self.initialize()
+
+        result_u = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        result_v = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        result_w = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+
+        receiver_loc_array = cp.array(self.receiver_loc)
+        rec_i = receiver_loc_array[:, 0]
+        rec_j = receiver_loc_array[:, 1]
+        src_loc_array = cp.array(self.src_loc)
+        src_i = src_loc_array[:, 0]
+        src_j = src_loc_array[:, 1]
+
+        # Precompute snapshot lookup on CPU to avoid GPU linear search every step
+        isnap_dict = {int(s): idx for idx, s in enumerate(isnaps.get())}
+
+        gui = SimulationGUI(self.nx, self.nz, self.dx, self.dz)
+        gui.isnap = self.isnap
+        gui.setup(self.nt)
+
+        it = 0
+        step_time_ms = 0.0
+
+        while gui.is_running():
+            if gui.playing and it < self.nt:
+                t0 = time.perf_counter()
+
+                self.set_boundary_condition()
+                self.update_vel(order=self.order)
+
+                t = (self.nt - 1) - it  # real (reversed) timestep
+                self.u[rec_i, rec_j] += self.obsdata_u[:, t]
+                self.v[rec_i, rec_j] += self.obsdata_v[:, t]
+                self.w[rec_i, rec_j] += self.obsdata_w[:, t]
+
+                self.update_str(order=self.order)
+
+                self.synsrc_u[:, t] = self.u[src_i, src_j]
+                self.synsrc_v[:, t] = self.v[src_i, src_j]
+                self.synsrc_w[:, t] = self.w[src_i, src_j]
+
+                # Cross-correlation at snapshot steps
+                if t in isnap_dict:
+                    idx = isnap_dict[t]
+                    fw_u = import_fwdata_u[:, :, idx].squeeze()
+                    fw_v = import_fwdata_v[:, :, idx].squeeze()
+                    fw_w = import_fwdata_w[:, :, idx].squeeze()
+                    if method == 'cross_correlation':
+                        delta_u = fw_u * self.u
+                        delta_v = fw_v * self.v
+                        delta_w = fw_w * self.w
+                    elif method == 'convolution':
+                        delta_u = (fw_u * self.u) / (fw_u ** 2)
+                        delta_v = (fw_v * self.v) / (fw_v ** 2)
+                        delta_w = (fw_w * self.w) / (fw_w ** 2)
+                    else:
+                        gui.cleanup()
+                        raise ValueError('method must be cross_correlation or convolution')
+                    result_u += delta_u
+                    result_v += delta_v
+                    result_w += delta_w
+
+                    # Show correlation image at snapshot steps
+                    gui.update_textures(delta_u.get(), delta_v.get(), delta_w.get())
+                    gui.update_status(it, step_time_ms)
+                elif it % gui.isnap == 0:
+                    gui.update_textures(cp.asnumpy(self.u), cp.asnumpy(self.v), cp.asnumpy(self.w))
+                    gui.update_status(it, step_time_ms)
+
+                step_time_ms = (time.perf_counter() - t0) * 1000.0
+
+                if it % 100 == 0:
+                    if not cp.all(cp.isfinite(self.u)):
+                        gui.cleanup()
+                        return 4
+                    if not cp.all(cp.isfinite(self.v)):
+                        gui.cleanup()
+                        return 5
+                    if not cp.all(cp.isfinite(self.w)):
+                        gui.cleanup()
+                        return 6
+
+                it += 1
+                if it >= self.nt:
+                    gui.update_status(it, step_time_ms)
+
+            gui.render_frame()
+
+        gui.cleanup()
+        print('end backward modeling (GUI calc)')
         self.result_u = result_u
         self.result_v = result_v
         self.result_w = result_w
@@ -470,15 +571,16 @@ class backward_modeling(WaveSimulation):
                     gui.update_textures(u_cpu, v_cpu, w_cpu)
                     gui.update_status(it, step_time_ms)
 
-                if not cp.all(cp.isfinite(self.u)):
-                    gui.cleanup()
-                    return 4
-                if not cp.all(cp.isfinite(self.v)):
-                    gui.cleanup()
-                    return 5
-                if not cp.all(cp.isfinite(self.w)):
-                    gui.cleanup()
-                    return 6
+                if it % 100 == 0:
+                    if not cp.all(cp.isfinite(self.u)):
+                        gui.cleanup()
+                        return 4
+                    if not cp.all(cp.isfinite(self.v)):
+                        gui.cleanup()
+                        return 5
+                    if not cp.all(cp.isfinite(self.w)):
+                        gui.cleanup()
+                        return 6
 
                 it += 1
 

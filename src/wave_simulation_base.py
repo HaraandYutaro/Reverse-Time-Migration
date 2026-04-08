@@ -21,6 +21,112 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 
+# ---------------------------------------------------------------------------
+# CUDA RawKernel sources for fused FDM update (order 2, SH + P-SV)
+# ---------------------------------------------------------------------------
+_UPDATE_VEL_ORDER2_SRC = r'''
+extern "C" __global__
+void update_vel_order2(
+    float* __restrict__ u,
+    float* __restrict__ v,
+    float* __restrict__ w,
+    const float* __restrict__ sxx,
+    const float* __restrict__ szz,
+    const float* __restrict__ sxz,
+    const float* __restrict__ syx,
+    const float* __restrict__ syz,
+    const float* __restrict__ dt_over_rho_u,
+    const float* __restrict__ dt_over_rho_w,
+    const float* __restrict__ dt_over_rho,
+    const float inv_dx, const float inv_dz,
+    const float sign,
+    const int a_di, const int b_di,
+    const int a_dj, const int b_dj,
+    const int nx, const int nz
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (i >= nx - 1 || j >= nz - 1) return;
+
+    int ij    = i * nz + j;
+    int ij_ax = (i + a_di) * nz + j;
+    int ij_bx = (i + b_di) * nz + j;
+    int ij_az = i * nz + (j + a_dj);
+    int ij_bz = i * nz + (j + b_dj);
+
+    /* P-SV: u */
+    float sxx_x = (sxx[ij_ax] - sxx[ij_bx]) * inv_dx;
+    float sxz_z = (sxz[ij_az] - sxz[ij_bz]) * inv_dz;
+    u[ij] += sign * (sxx_x + sxz_z) * dt_over_rho_u[ij];
+
+    /* P-SV: w */
+    float sxz_x = (sxz[ij_ax] - sxz[ij_bx]) * inv_dx;
+    float szz_z = (szz[ij_az] - szz[ij_bz]) * inv_dz;
+    w[ij] += sign * (sxz_x + szz_z) * dt_over_rho_w[ij];
+
+    /* SH: v */
+    float syx_x = (syx[ij_ax] - syx[ij_bx]) * inv_dx;
+    float syz_z = (syz[ij_az] - syz[ij_bz]) * inv_dz;
+    v[ij] += sign * (syx_x + syz_z) * dt_over_rho[ij];
+}
+'''
+
+_UPDATE_STR_ORDER2_SRC = r'''
+extern "C" __global__
+void update_str_order2(
+    float* __restrict__ sxx,
+    float* __restrict__ szz,
+    float* __restrict__ sxz,
+    float* __restrict__ syx,
+    float* __restrict__ syz,
+    const float* __restrict__ u,
+    const float* __restrict__ v,
+    const float* __restrict__ w,
+    const float* __restrict__ lam,
+    const float* __restrict__ mu,
+    const float* __restrict__ mxz,
+    const float* __restrict__ myx,
+    const float* __restrict__ myz,
+    const float dt, const float inv_dx, const float inv_dz,
+    const float sign,
+    const int a_di, const int b_di,
+    const int a_dj, const int b_dj,
+    const int nx, const int nz
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x + 1;
+    int j = blockIdx.y * blockDim.y + threadIdx.y + 1;
+    if (i >= nx - 1 || j >= nz - 1) return;
+
+    int ij    = i * nz + j;
+    int ij_ax = (i + a_di) * nz + j;
+    int ij_bx = (i + b_di) * nz + j;
+    int ij_az = i * nz + (j + a_dj);
+    int ij_bz = i * nz + (j + b_dj);
+
+    /* P-SV */
+    float u_x = (u[ij_ax] - u[ij_bx]) * inv_dx;
+    float u_z = (u[ij_az] - u[ij_bz]) * inv_dz;
+    float w_x = (w[ij_ax] - w[ij_bx]) * inv_dx;
+    float w_z = (w[ij_az] - w[ij_bz]) * inv_dz;
+
+    float div  = u_x + w_z;
+    float sdt  = sign * dt;
+    float l_ij = lam[ij];
+    float m_ij = mu[ij];
+
+    sxx[ij] += sdt * (l_ij * div + 2.0f * m_ij * u_x);
+    szz[ij] += sdt * (l_ij * div + 2.0f * m_ij * w_z);
+    sxz[ij] += sdt * mxz[ij] * (u_z + w_x);
+
+    /* SH */
+    float v_x = (v[ij_ax] - v[ij_bx]) * inv_dx;
+    float v_z = (v[ij_az] - v[ij_bz]) * inv_dz;
+    syx[ij] += sdt * myx[ij] * v_x;
+    syz[ij] += sdt * myz[ij] * v_z;
+}
+'''
+
+
 class WaveSimulation:
     """
     Base class for forward and backward elastic wave simulation.
@@ -135,7 +241,75 @@ class WaveSimulation:
         for j in range(FW):
             absorb_coeff[j:nx - j, nz - j - 1] = coeff[j]
 
+        self._absorb_FW = FW
         return absorb_coeff
+
+    # ------------------------------------------------------------------
+    # Fused CUDA kernel helpers (order 2)
+    # ------------------------------------------------------------------
+
+    def _compile_fdm_kernels(self):
+        """Compile CUDA kernels and precompute per-cell dt/rho ratios.
+
+        Must be called at the end of subclass initialize() after dt, rho_u,
+        rho_w, rho, lam, mu, mxz, myx, myz are all set.
+        """
+        self._vel_kernel = cp.RawKernel(_UPDATE_VEL_ORDER2_SRC, 'update_vel_order2')
+        self._str_kernel = cp.RawKernel(_UPDATE_STR_ORDER2_SRC, 'update_str_order2')
+
+        # Precompute dt/rho so the kernel avoids per-thread division
+        self._dt_over_rho_u = (self.dt / self.rho_u).astype(cp.float32)
+        self._dt_over_rho_w = (self.dt / self.rho_w).astype(cp.float32)
+        self._dt_over_rho_v = (self.dt / self.rho).astype(cp.float32)
+
+        # Cache scalar args as numpy types (avoid repeated conversion each step)
+        self._inv_dx = np.float32(1.0 / float(self.dx))
+        self._inv_dz = np.float32(1.0 / float(self.dz))
+        self._dt_f32 = np.float32(float(self.dt))
+        self._nx_i32 = np.int32(self.nx)
+        self._nz_i32 = np.int32(self.nz)
+
+        # Grid / block for interior points [1, nx-1) x [1, nz-1)
+        self._block = (16, 16)
+        self._grid = ((self.nx - 2 + 15) // 16, (self.nz - 2 + 15) // 16)
+
+    def _launch_vel_kernel(self, sign, a_di, b_di, a_dj, b_dj):
+        self._vel_kernel(
+            self._grid, self._block,
+            (self.u, self.v, self.w,
+             self.sxx, self.szz, self.sxz,
+             self.syx, self.syz,
+             self._dt_over_rho_u, self._dt_over_rho_w, self._dt_over_rho_v,
+             self._inv_dx, self._inv_dz,
+             np.float32(sign),
+             np.int32(a_di), np.int32(b_di),
+             np.int32(a_dj), np.int32(b_dj),
+             self._nx_i32, self._nz_i32))
+
+    def _launch_str_kernel(self, sign, a_di, b_di, a_dj, b_dj):
+        self._str_kernel(
+            self._grid, self._block,
+            (self.sxx, self.szz, self.sxz,
+             self.syx, self.syz,
+             self.u, self.v, self.w,
+             self.lam, self.mu, self.mxz,
+             self.myx, self.myz,
+             self._dt_f32, self._inv_dx, self._inv_dz,
+             np.float32(sign),
+             np.int32(a_di), np.int32(b_di),
+             np.int32(a_dj), np.int32(b_dj),
+             self._nx_i32, self._nz_i32))
+
+    def apply_absorb(self, field):
+        """Apply absorbing coefficient only at boundary slices (not the full grid)."""
+        FW = self._absorb_FW
+        nz = self.nz
+        # Left x-boundary
+        field[:FW, :] *= self.absorb_coeff[:FW, :]
+        # Right x-boundary
+        field[-FW:, :] *= self.absorb_coeff[-FW:, :]
+        # Bottom z-boundary (middle rows only, left/right already handled)
+        field[FW:-FW, -FW:] *= self.absorb_coeff[FW:-FW, -FW:]
 
     def set_boundary_condition(self):
         if self.receivers_height is None:
@@ -144,9 +318,9 @@ class WaveSimulation:
             self.sxz[:, 0] = 0
             self.szz[:, 0] = 0
         else:
-            self.syz = self.syz * self.surface_matrix
-            self.sxz = self.sxz * self.surface_matrix
-            self.szz = self.szz * self.surface_matrix
+            self.syz *= self.surface_matrix
+            self.sxz *= self.surface_matrix
+            self.szz *= self.surface_matrix
 
     # ------------------------------------------------------------------
     # Shared visualisation helpers

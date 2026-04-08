@@ -125,6 +125,9 @@ class forward_modeling(WaveSimulation):
         self.wavelet_v = self.initialize_wavelet(self.wavelet_v)
         self.wavelet_w = self.initialize_wavelet(self.wavelet_w)
 
+        # Compile fused CUDA kernels for order-2 FDM updates
+        self._compile_fdm_kernels()
+
     def initialize_wavelet(self, wavelet, show=False):
         if wavelet is None:
             print('wavelet is None. make gaussian source of f0 = ', self.f0)
@@ -175,9 +178,9 @@ class forward_modeling(WaveSimulation):
             self._update_vel_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.u *= self.absorb_coeff
-        self.v *= self.absorb_coeff
-        self.w *= self.absorb_coeff
+        self.apply_absorb(self.u)
+        self.apply_absorb(self.v)
+        self.apply_absorb(self.w)
 
     def update_str(self, order):
         if order == 2:
@@ -186,27 +189,15 @@ class forward_modeling(WaveSimulation):
             self._update_str_order3()
         else:
             raise ValueError('order must be 2 or 3')
-        self.sxx *= self.absorb_coeff
-        self.sxz *= self.absorb_coeff
-        self.szz *= self.absorb_coeff
-        self.syx *= self.absorb_coeff
-        self.syz *= self.absorb_coeff
+        self.apply_absorb(self.sxx)
+        self.apply_absorb(self.sxz)
+        self.apply_absorb(self.szz)
+        self.apply_absorb(self.syx)
+        self.apply_absorb(self.syz)
 
     def _update_vel_order2(self):
-        # P-SV wave update:
-        sxx_x = (self.sxx[1:-1, 1:-1] - self.sxx[0:-2, 1:-1]) / self.dx
-        szz_z = (self.szz[1:-1, 1:-1] - self.szz[1:-1, 0:-2]) / self.dz
-        sxz_x = (self.sxz[1:-1, 1:-1] - self.sxz[0:-2, 1:-1]) / self.dx
-        sxz_z = (self.sxz[1:-1, 1:-1] - self.sxz[1:-1, 0:-2]) / self.dz
-        du = (sxx_x + sxz_z) * (self.dt / self.rho_u[1:-1, 1:-1])
-        dw = (sxz_x + szz_z) * (self.dt / self.rho_w[1:-1, 1:-1])
-        self.u[1:-1, 1:-1] += du
-        self.w[1:-1, 1:-1] += dw
-        # SH wave update:
-        syx_x = (self.syx[1:-1, 1:-1] - self.syx[0:-2, 1:-1]) / self.dx
-        syz_z = (self.syz[1:-1, 1:-1] - self.syz[1:-1, 0:-2]) / self.dz
-        dv = (syx_x + syz_z) * (self.dt / self.rho[1:-1, 1:-1])
-        self.v[1:-1, 1:-1] += dv
+        # Forward: backward-difference stencil, sign = +1
+        self._launch_vel_kernel(1.0, 0, -1, 0, -1)
 
     def _update_vel_order3(self):
         # インデックス範囲を設定
@@ -236,25 +227,8 @@ class forward_modeling(WaveSimulation):
         self.v[i_start:i_end, j_start:j_end] += dv
 
     def _update_str_order2(self):
-        # P-SV wave update:
-        u_x = (self.u[2:, 1:-1] - self.u[1:-1, 1:-1]) / self.dx
-        u_z = (self.u[1:-1, 2:] - self.u[1:-1, 1:-1]) / self.dz
-        w_x = (self.w[2:, 1:-1] - self.w[1:-1, 1:-1]) / self.dx
-        w_z = (self.w[1:-1, 2:] - self.w[1:-1, 1:-1]) / self.dz
-        dsxx = self.dt * (self.lam[1:-1, 1:-1] * (u_x + w_z) + 2.0 * self.mu[1:-1, 1:-1] * u_x)
-        dszz = self.dt * (self.lam[1:-1, 1:-1] * (u_x + w_z) + 2.0 * self.mu[1:-1, 1:-1] * w_z)
-        dsxz = self.dt * (self.mxz[1:-1, 1:-1] * (u_z + w_x))
-        self.sxx[1:-1, 1:-1] += dsxx
-        self.szz[1:-1, 1:-1] += dszz
-        self.sxz[1:-1, 1:-1] += dsxz
-
-        # SH wave update:
-        v_x = (self.v[2:, 1:-1] - self.v[1:-1, 1:-1]) / self.dx
-        v_z = (self.v[1:-1, 2:] - self.v[1:-1, 1:-1]) / self.dz
-        dsyx = self.dt * self.myx[1:-1, 1:-1] * v_x
-        dsyz = self.dt * self.myz[1:-1, 1:-1] * v_z
-        self.syx[1:-1, 1:-1] += dsyx
-        self.syz[1:-1, 1:-1] += dsyz
+        # Forward: forward-difference stencil, sign = +1
+        self._launch_str_kernel(1.0, 1, 0, 1, 0)
 
     def _update_str_order3(self):
         # インデックス範囲を設定
@@ -300,10 +274,10 @@ class forward_modeling(WaveSimulation):
         """
         cp.get_default_memory_pool().free_all_blocks()
 
-        if save:  # allocate saved u,v,w, whose sizes are (nx,nz,nt//isnap)
-            self.u_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
-            self.v_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
-            self.w_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+        if save:  # allocate saved u,v,w as float16 to halve VRAM usage
+            self.u_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
+            self.v_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
+            self.w_save = cp.zeros((self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
             self.isnaps = cp.zeros(self.nt // self.isnap, dtype=cp.int32)
 
         self.initialize()
@@ -330,19 +304,21 @@ class forward_modeling(WaveSimulation):
                 if show:
                     self.display_wavefield()
 
-            if not cp.all(cp.isfinite(self.u)):
-                return 1
-            if not cp.all(cp.isfinite(self.v)):
-                return 2
-            if not cp.all(cp.isfinite(self.w)):
-                return 3
+            if it % 100 == 0:
+                if not cp.all(cp.isfinite(self.u)):
+                    return 1
+                if not cp.all(cp.isfinite(self.v)):
+                    return 2
+                if not cp.all(cp.isfinite(self.w)):
+                    return 3
 
-            # save wavefield if save
+            # save wavefield snapshot as float16
             if save and it % self.isnap == 0 and it != 0:
-                self.u_save[:, :, it // self.isnap - 1] = self.u
-                self.v_save[:, :, it // self.isnap - 1] = self.v
-                self.w_save[:, :, it // self.isnap - 1] = self.w
-                self.isnaps[it // self.isnap - 1] = it
+                idx = it // self.isnap - 1
+                self.u_save[:, :, idx] = self.u.astype(cp.float16)
+                self.v_save[:, :, idx] = self.v.astype(cp.float16)
+                self.w_save[:, :, idx] = self.w.astype(cp.float16)
+                self.isnaps[idx] = it
 
         if show:
             self.show_seismogram(self.seismogram_u.get(), 'u')
@@ -390,11 +366,11 @@ class forward_modeling(WaveSimulation):
 
         if save:
             self.u_save = cp.zeros(
-                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
             self.v_save = cp.zeros(
-                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
             self.w_save = cp.zeros(
-                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float32)
+                (self.nx, self.nz, self.nt // self.isnap), dtype=cp.float16)
             self.isnaps = cp.zeros(self.nt // self.isnap, dtype=cp.int32)
 
         self.initialize()
@@ -439,20 +415,22 @@ class forward_modeling(WaveSimulation):
                     gui.update_status(it, step_time_ms)
 
                 if save and it % self.isnap == 0 and it != 0:
-                    self.u_save[:, :, it // self.isnap - 1] = self.u
-                    self.v_save[:, :, it // self.isnap - 1] = self.v
-                    self.w_save[:, :, it // self.isnap - 1] = self.w
-                    self.isnaps[it // self.isnap - 1] = it
+                    idx = it // self.isnap - 1
+                    self.u_save[:, :, idx] = self.u.astype(cp.float16)
+                    self.v_save[:, :, idx] = self.v.astype(cp.float16)
+                    self.w_save[:, :, idx] = self.w.astype(cp.float16)
+                    self.isnaps[idx] = it
 
-                if not cp.all(cp.isfinite(self.u)):
-                    gui.cleanup()
-                    return 1
-                if not cp.all(cp.isfinite(self.v)):
-                    gui.cleanup()
-                    return 2
-                if not cp.all(cp.isfinite(self.w)):
-                    gui.cleanup()
-                    return 3
+                if it % 100 == 0:
+                    if not cp.all(cp.isfinite(self.u)):
+                        gui.cleanup()
+                        return 1
+                    if not cp.all(cp.isfinite(self.v)):
+                        gui.cleanup()
+                        return 2
+                    if not cp.all(cp.isfinite(self.w)):
+                        gui.cleanup()
+                        return 3
 
                 it += 1
 

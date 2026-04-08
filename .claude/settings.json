@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "deny": [
+      "Write(./docs/**)",
+      "Write(./documentation/**)",
+      "Write(README.md)",
+      "Edit(README.md)"
+    ]
+  }
+}
