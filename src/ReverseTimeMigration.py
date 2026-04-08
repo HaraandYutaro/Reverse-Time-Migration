@@ -241,7 +241,8 @@ class ReverseTimeMigration:
             surface_matrix=surface_matrix,
             steepness_array=steepness_array,
         )
-        flag = _fw.run(show=self.debug, save=True)
+        cp.get_default_memory_pool().free_all_blocks()
+        flag = _fw.run_gui(save=True) if self.debug else _fw.run(show=False, save=True)
         return flag, _fw
 
     def _run_backward(self, nx, nz, dx, dz, nt,
@@ -250,6 +251,7 @@ class ReverseTimeMigration:
                       surface_matrix, steepness_array,
                       _fw, backwardmodel_method):
         """Instantiate and run backward_modeling with cross-correlation. Returns (flag, _bw)."""
+        cp.get_default_memory_pool().free_all_blocks()
         _bw = bk.backward_modeling(
             nx=nx, nz=nz, dx=dx, dz=dz,
             nt=nt, fs=self.fs,
@@ -265,15 +267,18 @@ class ReverseTimeMigration:
             surface_matrix=surface_matrix,
             steepness_array=steepness_array,
         )
-        flag = _bw.run_calc(
-            show=self.debug,
-            import_fwdata_u=_fw.u_save,
-            import_fwdata_v=_fw.v_save,
-            import_fwdata_w=_fw.w_save,
-            isnaps=_fw.isnaps,
-            save=False,
-            method=backwardmodel_method,
-        )
+        if self.debug:
+            flag = _bw.run_gui()
+        else:
+            flag = _bw.run_calc(
+                show=False,
+                import_fwdata_u=_fw.u_save,
+                import_fwdata_v=_fw.v_save,
+                import_fwdata_w=_fw.w_save,
+                isnaps=_fw.isnaps,
+                save=False,
+                method=backwardmodel_method,
+            )
         return flag, _bw
 
     def run(self, total_memory=24000, memory_merge=2000, backwardmodel_method='cross_correlation'):
@@ -322,6 +327,7 @@ class ReverseTimeMigration:
                 continue
             print('The forward modeling is safe. pass to the backward modeling.')
 
+            cp.get_default_memory_pool().free_all_blocks()
             flag, _bw = self._run_backward(
                 nx, nz, dx, dz, self.nt,
                 vs, vp, rho, absorbing_frame,

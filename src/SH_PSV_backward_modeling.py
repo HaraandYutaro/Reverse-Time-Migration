@@ -15,6 +15,8 @@
 # along with this library. If not, see <https://www.gnu.org/licenses/>.
 
 # 1. backward modeling
+import time
+
 import cupy as cp  # CuPy is imported as cp for compatibility
 import matplotlib.pyplot as plt
 plt.style.use('fast')
@@ -67,9 +69,9 @@ class backward_modeling(WaveSimulation):
         plt.show()
 
     def initialize(self):
-        self.synsrc_u = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
-        self.synsrc_v = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
-        self.synsrc_w = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float64)
+        self.synsrc_u = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float32)
+        self.synsrc_v = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float32)
+        self.synsrc_w = cp.zeros((len(self.src_loc), self.nt), dtype=cp.float32)
 
         self.mu = self.rho * self.vs ** 2
         self.lam = ((self.vp / self.vs) ** 2 - 2) * self.mu
@@ -77,24 +79,24 @@ class backward_modeling(WaveSimulation):
 
         # stress
         # for p-sv wave propagation, sxx, sxz, szz
-        self.sxx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.sxz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.szz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        self.sxx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.sxz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.szz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
         # for sh wave propagation, syx, syz
-        self.syx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.syz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        self.syx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.syz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
 
         # velocity
         # u, v, w for each x,y,z,axis
-        self.u = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.v = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.w = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        self.u = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.v = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.w = cp.zeros((self.nx, self.nz), dtype=cp.float32)
 
         # shear modulus mu
         # mxx,mzz=self.mu for p-sv wave propagation
-        self.mxz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.myx = cp.zeros((self.nx, self.nz), dtype=cp.float64)
-        self.myz = cp.zeros((self.nx, self.nz), dtype=cp.float64)
+        self.mxz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.myx = cp.zeros((self.nx, self.nz), dtype=cp.float32)
+        self.myz = cp.zeros((self.nx, self.nz), dtype=cp.float32)
 
         self.myx, self.myz = self.shear_avg_SH()
         self.mxz = self.shear_avg_PSV()
@@ -397,3 +399,94 @@ class backward_modeling(WaveSimulation):
         plt.plot(self.synsrc_w.get()[0, :], label='w')
         plt.legend()
         plt.show()
+
+    def run_gui(self):
+        """
+        Run backward modeling with a Dear PyGui interactive viewer.
+
+        The simulation advances one time-step per rendered GUI frame in reverse
+        time order (t = nt-1 → 0). Wavefield textures are updated on the
+        GPU→CPU transfer only when ``step % gui.isnap == 0``.
+
+        return:
+             0: simulation completed,
+             4: u diverged (infinite),
+             5: v diverged (infinite),
+             6: w diverged (infinite).
+        """
+        from visualizer import SimulationGUI  # optional DPG dependency
+
+        cp.get_default_memory_pool().free_all_blocks()
+
+        self.initialize()
+
+        # Precompute index arrays and scaling factors (mirrors run())
+        rec_loc_arr = cp.array(self.receiver_loc)
+        rec_i = rec_loc_arr[:, 0]
+        rec_j = rec_loc_arr[:, 1]
+        scale = cp.float32(self.dt * self.dx * self.dz / self.maxAD)
+        rec_scale_u = (scale / self.rho_u[rec_i, rec_j]).astype(cp.float32)
+        rec_scale_v = (scale / self.rho[rec_i, rec_j]).astype(cp.float32)
+        rec_scale_w = (scale / self.rho_w[rec_i, rec_j]).astype(cp.float32)
+        src_loc_arr = cp.array(self.src_loc)
+        src_i = src_loc_arr[:, 0]
+        src_j = src_loc_arr[:, 1]
+
+        gui = SimulationGUI(self.nx, self.nz, self.dx, self.dz)
+        gui.isnap = self.isnap
+        gui.setup(self.nt)
+
+        it = 0
+        step_time_ms = 0.0
+
+        while gui.is_running():
+            if gui.playing and it < self.nt:
+                t0 = time.perf_counter()
+
+                self.set_boundary_condition()
+
+                t = self.nt - it - 1  # real (reversed) timestep
+                self.update_vel(order=self.order)
+
+                # Observed data injection at receiver locations (time-reversed)
+                self.u[rec_i, rec_j] += self.obsdata_u[:, t] * rec_scale_u
+                self.v[rec_i, rec_j] += self.obsdata_v[:, t] * rec_scale_v
+                self.w[rec_i, rec_j] += self.obsdata_w[:, t] * rec_scale_w
+
+                self.update_str(order=self.order)
+
+                # Synthetic source extraction (stays on GPU)
+                self.synsrc_u[:, t] = self.u[src_i, src_j]
+                self.synsrc_v[:, t] = self.v[src_i, src_j]
+                self.synsrc_w[:, t] = self.w[src_i, src_j]
+
+                step_time_ms = (time.perf_counter() - t0) * 1000.0
+
+                # GPU→CPU transfer only when display update is due
+                if it % gui.isnap == 0:
+                    u_cpu = cp.asnumpy(self.u)
+                    v_cpu = cp.asnumpy(self.v)
+                    w_cpu = cp.asnumpy(self.w)
+                    gui.update_textures(u_cpu, v_cpu, w_cpu)
+                    gui.update_status(it, step_time_ms)
+
+                if not cp.all(cp.isfinite(self.u)):
+                    gui.cleanup()
+                    return 4
+                if not cp.all(cp.isfinite(self.v)):
+                    gui.cleanup()
+                    return 5
+                if not cp.all(cp.isfinite(self.w)):
+                    gui.cleanup()
+                    return 6
+
+                it += 1
+
+                if it >= self.nt:
+                    gui.update_status(it, step_time_ms)
+
+            gui.render_frame()
+
+        gui.cleanup()
+        print('end backward modeling (GUI)')
+        return 0
